@@ -13,8 +13,8 @@ from torch import nn
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
-
-from g2p_en import G2p
+from text_normalizer import phonemize_with_lexicon
+from text_normalizer import load_lexicon
 
 import logging
 logger = logging.getLogger(__name__)
@@ -35,6 +35,33 @@ MEL_PARAMS = {
     "hop_length": 300
 }
 
+
+def load_duration_map(filepath='dataset.txt'):
+    """
+    Lädt die dataset.txt und erstellt ein Mapping von Dateinamen zu Dauer.
+    Gibt None zurück, wenn die Datei nicht gefunden wird.
+    """
+    if not os.path.exists(filepath):
+        logger.warning(f"Datei zur Dauer-Filterung nicht gefunden: {filepath}. Filterung wird übersprungen.")
+        return None
+
+    duration_map = {}
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            next(f)  # Überspringe die Kopfzeile
+            for line in f:
+                parts = line.strip().split(';')
+                if len(parts) == 2:
+                    duration_str, filename = parts
+                    # Konvertiere deutsches Komma zu Punkt für die float-Umwandlung
+                    duration = float(duration_str.replace(',', '.'))
+                    duration_map[filename] = duration
+    except Exception as e:
+        logger.error(f"Fehler beim Lesen der Dauer-Datei {filepath}: {e}")
+        return None
+    return duration_map
+
+
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
@@ -53,12 +80,25 @@ class MelDataset(torch.utils.data.Dataset):
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
         self.mean, self.std = -4, 4
         
-        self.g2p = G2p()
+        self.phonemizer = None # Nur deklarieren, nicht initialisieren
 
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
+
+        # --- Lazy Initialisierung des Phonemizers ---
+        if self.phonemizer is None:
+            # LOKALER IMPORT: Nur im Worker-Prozess ausführen
+            from phonemizer.backend import EspeakBackend
+            self.phonemizer = EspeakBackend(
+                language='de',
+                preserve_punctuation=False,
+                language_switch='remove-flags',
+                punctuation_marks=';:,.!?¡¿—…"«»“”()[]{}',
+                with_stress=False
+            )
+
         data = self.data_list[idx]
         wave, text_tensor, speaker_id = self._load_tensor(data)
         wave_tensor = torch.from_numpy(wave).float()
@@ -81,15 +121,29 @@ class MelDataset(torch.utils.data.Dataset):
         speaker_id = int(speaker_id)
         wave, sr = sf.read(wave_path)
 
-        # phonemize the text
-        ps = self.g2p(text.replace('-', ' '))
-        if "'" in ps:
-            ps.remove("'")
-        text = self.text_cleaner(ps)
+        from phonemizer.separator import Separator
+
+        normalized_text = phonemize_with_lexicon(text, self.phonemizer)
+        # phonemize the text (Deutsch)
+        phoneme_str = self.phonemizer.phonemize([normalized_text], strip=True,
+                                                separator=Separator(phone=' ', word='  ', syllable=''))[0]
+
+        # phonemizer gibt einen String zurück, z. B. "ˈhallo"
+        # oder Silben mit Leerzeichen getrennt, z. B. "ˈh a l oː"
+
+        # optional: vereinheitlichen / Leerzeichen entfernen
+        phoneme_list = phoneme_str.split()
+
+        # evtl. Apostrophe entfernen, falls welche vorkommen
+        phoneme_list = [p for p in phoneme_list if p != "'"]
+
+        # Text-Cleaner + Mapping in Indizes
+        text = self.text_cleaner(phoneme_list)
+
         blank_index = self.text_cleaner.word_index_dictionary[" "]
-        text.insert(0, blank_index) # add a blank at the beginning (silence)
-        text.append(blank_index) # add a blank at the end (silence)
-        
+        text.insert(0, blank_index)  # silence at beginning
+        text.append(blank_index)
+
         text = torch.LongTensor(text)
 
         return wave, text, speaker_id
@@ -149,6 +203,26 @@ def build_dataloader(path_list,
                      device='cpu',
                      collate_config={},
                      dataset_config={}):
+
+    # --- NEUE FILTERLOGIK ---
+    duration_map = load_duration_map('./datacheck/dataset.txt')
+    if duration_map is not None:
+        original_count = len(path_list)
+
+        # Filtere die path_list basierend auf der Dauer
+        filtered_list = []
+        for item in path_list:
+            # Extrahiere den Dateinamen aus dem Pfad in der Liste
+            filename = os.path.basename(item.split('|')[0])
+            duration = duration_map.get(filename)
+
+            if duration is not None and 10.0 >= duration >= 1.0:
+                filtered_list.append(item)
+
+        logger.info(
+            f"Dauer-Filterung: {original_count} Dateien gefunden, {len(filtered_list)} Dateien nach Filter (<= 15s) behalten.")
+        path_list = filtered_list
+    # --- ENDE DER FILTERLOGIK ---
 
     dataset = MelDataset(path_list, **dataset_config)
     collate_fn = Collater(**collate_config)
