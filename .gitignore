@@ -1,0 +1,8 @@
+/Checkpoint/
+/.venv/
+/venvu/
+/__pycache__/
+/.idea/
+/Data/
+/datacheck/dataset.txt
+/lengths.npy
