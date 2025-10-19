@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import click
-
+from memory_profiler import profile
 import logging
 from logging import StreamHandler
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ torch.backends.cudnn.benchmark = True
 
 @click.command()
 @click.option('-p', '--config_path', default='./Configs/config.yml', type=str)
+# Der @profile Decorator wird entfernt, um mprof zu verwenden
 def main(config_path):
     config = yaml.safe_load(open(config_path))
     log_dir = config['log_dir']
@@ -45,37 +46,46 @@ def main(config_path):
     device = config.get('device', 'cpu')
     epochs = config.get('epochs', 1000)
     save_freq = config.get('save_freq', 20)
+    save_every_steps = config.get('save_every_steps', 100)
     train_path = config.get('train_data', None)
     val_path = config.get('val_data', None)
 
-    train_list, val_list = get_data_path_list(train_path, val_path)
-    train_dataloader = build_dataloader(train_list,
+    # train_list, val_list = get_data_path_list(train_path, val_path) # Nicht mehr benötigt
+    train_dataloader = build_dataloader(train_path, # Direkt den Pfad übergeben
                                         batch_size=batch_size,
-                                        num_workers=8,
+                                        num_workers=0,
                                         dataset_config=config.get('dataset_params', {}),
                                         device=device)
 
-    val_dataloader = build_dataloader(val_list,
+    val_dataloader = build_dataloader(val_path, # Direkt den Pfad übergeben
                                       batch_size=batch_size,
                                       validation=True,
-                                      num_workers=2,
+                                      num_workers=0,
                                       device=device,
                                       dataset_config=config.get('dataset_params', {}))
 
     model = build_model(model_params=config['model_params'] or {})
 
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     scheduler_params = {
             "max_lr": float(config['optimizer_params'].get('lr', 5e-4)),
             "pct_start": float(config['optimizer_params'].get('pct_start', 0.0)),
             "epochs": epochs,
-            "steps_per_epoch": len(train_dataloader),
+            # Korrigiere die Anzahl der Schritte für den Scheduler
+            "steps_per_epoch": len(train_dataloader) // gradient_accumulation_steps,
         }
 
     model.to(device)
     optimizer, scheduler = build_optimizer(
         {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
 
-    blank_index = train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
+    # Da text_cleaner jetzt lazy geladen wird, erstellen wir eine temporäre Instanz, um den blank_index zu erhalten.
+    from text_utils import TextCleaner
+    # Lese dict_path sicher aus der Konfiguration, mit einem Standardwert.
+    dataset_params = config.get('dataset_params', {})
+    from meldataset import DEFAULT_DICT_PATH
+    dict_path = dataset_params.get('dict_path', DEFAULT_DICT_PATH)
+    blank_index = TextCleaner(dict_path).word_index_dictionary[" "]
 
     criterion = build_criterion(critic_params={
                 'ctc': {'blank': blank_index},
@@ -88,8 +98,11 @@ def main(config_path):
                     device=device,
                     train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,
-                    logger=logger)
-
+                    logger=logger,
+                    save_every_steps=save_every_steps,  # Übergebe den neuen Parameter
+                    log_dir=log_dir,  # Übergebe auch das Log-Verzeichnis
+                    gradient_accumulation_steps=gradient_accumulation_steps
+                    )
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],
                                 load_only_params=config.get('load_only_params', True))

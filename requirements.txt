@@ -1,0 +1,13 @@
+pillow
+tqdm
+SoundFile
+torchaudio
+torch
+tensorboard
+jiwer
+pyyaml
+click
+matplotlib
+phonemizer
+librosa
+pandas

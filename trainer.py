@@ -11,7 +11,9 @@ import torch
 from torch import nn
 from PIL import Image
 from tqdm import tqdm
-
+import os.path as osp
+import glob
+import os
 from utils import calc_wer
 
 import logging
@@ -31,13 +33,15 @@ class Trainer(object):
                  logger=logger,
                  train_dataloader=None,
                  val_dataloader=None,
+                 save_every_steps=None,
+                 log_dir='.',
                  initial_steps=0,
-                 initial_epochs=0):
+                 initial_epochs=0,
+                 gradient_accumulation_steps=1):
 
-        self.steps = initial_steps
         self.epochs = initial_epochs
         self.model = model
-        self.criterion = criterion
+        #self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.train_dataloader = train_dataloader
@@ -47,6 +51,11 @@ class Trainer(object):
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
+        self.save_every_steps = save_every_steps
+        self.log_dir = log_dir
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.criterion = criterion
+        self.global_step = 0  # Globalen Schrittzähler initialisieren
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -56,7 +65,7 @@ class Trainer(object):
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
-            "steps": self.steps,
+            "steps": self.global_step, # Speichere den globalen Schrittzähler
             "epochs": self.epochs,
         }
         state_dict["model"] = self.model.state_dict()
@@ -64,6 +73,21 @@ class Trainer(object):
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
+        #self.logger.info(f"Checkpoint gespeichert: {checkpoint_path}")
+
+        # --- Checkpoint-Rotation: Nur die letzten 3 behalten ---
+        # Finde alle Checkpoints (sowohl step- als auch epoch-basiert)
+        checkpoints = sorted(
+            glob.glob(osp.join(self.log_dir, 'step_*.pth')) +
+            glob.glob(osp.join(self.log_dir, 'epoch_*.pth')),
+            key=os.path.getmtime
+        )
+
+        # Wenn mehr als 3 Checkpoints vorhanden sind, lösche die ältesten
+        if len(checkpoints) > 3:
+            for old_checkpoint in checkpoints[:-3]:
+                #self.logger.info(f"Lösche alten Checkpoint: {os.path.basename(old_checkpoint)}")
+                os.remove(old_checkpoint)
 
     def load_checkpoint(self, checkpoint_path, load_only_params=False):
         """Load checkpoint.
@@ -77,7 +101,7 @@ class Trainer(object):
         self._load(state_dict["model"], self.model)
 
         if not load_only_params:
-            self.steps = state_dict["steps"]
+            self.global_step = state_dict.get("steps") # Lade den globalen Schrittzähler
             self.epochs = state_dict["epochs"]
             self.optimizer.load_state_dict(state_dict["optimizer"])
 
@@ -187,6 +211,14 @@ class Trainer(object):
             losses = self.run(batch)
             for key, value in losses.items():
                 train_losses["train/%s" % key].append(value)
+            
+            self.global_step += 1 # 1. Schrittzähler nach jedem Batch erhöhen
+            
+            # 2. Prüfen, ob ein Checkpoint gespeichert werden soll
+            if self.save_every_steps and (self.global_step % self.save_every_steps == 0):
+                checkpoint_path = osp.join(self.log_dir, 'step_%09d.pth' % self.global_step)
+                self.save_checkpoint(checkpoint_path)
+                #self.logger.info(f"Checkpoint bei Schritt {self.global_step} gespeichert.")
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
         train_losses['train/learning_rate'] = self._get_lr()

@@ -1,0 +1,12 @@
+/Data/*.*
+/.venv/
+/datacheck/dataset.txt
+/venvu/
+/lengths.npy
+/Checkpoint/
+/.idea/
+/__pycache__/*.*
+/Data/train_list.txt.orig
+/Data/val_list.txt.orig
+./Data/train_list.txt
+./Data/val_list.txt
