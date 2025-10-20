@@ -15,8 +15,8 @@ ADDITIONAL_PHONEMES = {
 }
 
 # Pfade zu den Dateien
-input_file_path = '/mnt/d/Projekte/StyleTTS/AuxiliaryASR/Data/val_list.txt'
-output_file_path = '/mnt/d/Projekte/StyleTTS/AuxiliaryASR/Data/val_list_processed.txt'
+input_file_path = '/mnt/d/Projekte/StyleTTS/AuxiliaryASR/Data/train_list.txt'
+output_file_path = '/mnt/d/Projekte/StyleTTS/AuxiliaryASR/Data/train_list_processed.txt'
 phones_lookup_path = '/mnt/d/Projekte/StyleTTS/AuxiliaryASR/Data/phones_lookup.txt'
 
 

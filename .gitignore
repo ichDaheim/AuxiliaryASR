@@ -6,3 +6,5 @@
 /Data/
 /datacheck/dataset.txt
 /lengths.npy
+/Data/train_list.txt
+/Data/val_list.txt
