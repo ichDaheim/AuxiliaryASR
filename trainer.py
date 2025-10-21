@@ -47,6 +47,7 @@ class Trainer(object):
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
+        self.grad_accum_steps = self.config.get("grad_accum_steps", 1)
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -152,7 +153,6 @@ class Trainer(object):
         return palette
 
     def run(self, batch):
-        self.optimizer.zero_grad()
         batch = [b.to(self.device) for b in batch]
         text_input, text_input_length, mel_input, mel_input_length = batch
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
@@ -172,23 +172,47 @@ class Trainer(object):
         loss_s2s /= text_input.size(0)
 
         loss = loss_ctc + loss_s2s
+
+        # Gradient Accumulation: Skaliere den Loss herunter
+        loss = loss / self.grad_accum_steps
+
         loss.backward()
-        torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
-        self.optimizer.step()
-        self.scheduler.step()
-        return {'loss': loss.item(),
+
+        #torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
+        #self.optimizer.step()
+        #self.scheduler.step()
+        return {'loss': loss.item() * self.grad_accum_steps,
                 'ctc': loss_ctc.item(),
                 's2s': loss_s2s.item()}
 
     def _train_epoch(self):
         train_losses = defaultdict(list)
         self.model.train()
-        for train_steps_per_epoch, batch in enumerate(tqdm(self.train_dataloader, desc="[train]"), 1):
-            losses = self.run(batch)
-            for key, value in losses.items():
-                train_losses["train/%s" % key].append(value)
+        self.optimizer.zero_grad(set_to_none=True)
 
-        train_losses = {key: np.mean(value) for key, value in train_losses.items()}
+        with tqdm(self.train_dataloader, desc="[train]") as pbar:
+            for step_idx, batch in enumerate(pbar, 1):
+                losses = self.run(batch)
+                for key, value in losses.items():
+                    train_losses[f"train/{key}"].append(value)
+
+                # Gradient Accumulation Step
+                if step_idx % self.grad_accum_steps == 0:
+                    # CPU-kompatibles Gradienten-Clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+            # Letzter Schritt am Ende der Epoche, falls Rest-Batches
+            if len(self.train_dataloader) % self.grad_accum_steps != 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+        # Mittelwerte
+        train_losses = {k: np.mean(v) for k, v in train_losses.items()}
         train_losses['train/learning_rate'] = self._get_lr()
         return train_losses
 
@@ -197,44 +221,45 @@ class Trainer(object):
         self.model.eval()
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
-        for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
-            text_input, text_input_length, mel_input, mel_input_length = batch
-            mel_input_length = mel_input_length // (2 ** self.model.n_down)
-            future_mask = self.model.get_future_mask(
-                mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
-            mel_mask = self.model.length_to_mask(mel_input_length)
-            text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
-            loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                          text_input, mel_input_length, text_input_length)
-            loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
-                loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
-            loss_s2s /= text_input.size(0)
-            loss = loss_ctc + loss_s2s
+        with tqdm(self.val_dataloader, desc="[eval]") as pbar:
+            for eval_steps_per_epoch, batch in enumerate(pbar, 1):
+                batch = [b.to(self.device) for b in batch]
+                text_input, text_input_length, mel_input, mel_input_length = batch
+                mel_input_length = mel_input_length // (2 ** self.model.n_down)
+                future_mask = self.model.get_future_mask(
+                    mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
+                mel_mask = self.model.length_to_mask(mel_input_length)
+                text_mask = self.model.length_to_mask(text_input_length)
+                ppgs, s2s_pred, s2s_attn = self.model(
+                    mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+                loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
+                                              text_input, mel_input_length, text_input_length)
+                loss_s2s = 0
+                for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
+                    loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
+                loss_s2s /= text_input.size(0)
+                loss = loss_ctc + loss_s2s
 
-            eval_losses["eval/ctc"].append(loss_ctc.item())
-            eval_losses["eval/s2s"].append(loss_s2s.item())
-            eval_losses["eval/loss"].append(loss.item())
+                eval_losses["eval/ctc"].append(loss_ctc.item())
+                eval_losses["eval/s2s"].append(loss_s2s.item())
+                eval_losses["eval/loss"].append(loss.item())
 
-            _, amax_ppgs = torch.max(ppgs, dim=2)
-            wers = [calc_wer(target[:text_length],
-                             pred[:mel_length],
-                             ignore_indexes=list(range(5))) \
-                    for target, pred, text_length, mel_length in zip(
-                            text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
-            eval_losses["eval/wer"].extend(wers)
+                _, amax_ppgs = torch.max(ppgs, dim=2)
+                wers = [calc_wer(target[:text_length],
+                                 pred[:mel_length],
+                                 ignore_indexes=list(range(5))) \
+                        for target, pred, text_length, mel_length in zip(
+                                text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
+                eval_losses["eval/wer"].extend(wers)
 
-            _, amax_s2s = torch.max(s2s_pred, dim=2)
-            acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
-                   for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
-            eval_losses["eval/acc"].extend(acc)
+                _, amax_s2s = torch.max(s2s_pred, dim=2)
+                acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
+                       for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
+                eval_losses["eval/acc"].extend(acc)
 
-            if eval_steps_per_epoch <= 2:
-                eval_images["eval/image"].append(
-                    self.get_image([s2s_attn[0].cpu().numpy()]))
+                if eval_steps_per_epoch <= 2:
+                    eval_images["eval/image"].append(
+                        self.get_image([s2s_attn[0].cpu().numpy()]))
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
